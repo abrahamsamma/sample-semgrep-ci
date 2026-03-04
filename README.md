@@ -79,18 +79,16 @@ jobs:
 
       # upload the results for the CodeQL GitHub app to annotate the code
       - name: Save SARIF results as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: semgrep-scan-results
           path: semgrep-results.sarif
 
       # Upload SARIF file generated in previous step
       - name: Upload SARIF result to the GitHub Security Dashboard
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep-results.sarif
         if: always()
 
 ```
-
-Take 2 test
