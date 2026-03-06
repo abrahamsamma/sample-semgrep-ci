@@ -137,7 +137,7 @@ jobs:
             body += '\n';
 
             if (findings.length === 0) {
-              body += 'No findings were detected by Semgrep in the changed/new files.\n';
+              body += 'No findings were detected by Semgrep in this PR\'s changes.\n';
             } else {
               body += '| Severity | Rule | File | Line | Message |\n';
               body += '|---|---|---|---:|---|\n';
