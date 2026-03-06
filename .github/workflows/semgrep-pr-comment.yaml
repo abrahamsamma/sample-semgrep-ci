@@ -78,9 +78,7 @@ jobs:
         if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets != 'true'
         run: |
           set -eu
-          cat > semgrep-results.json <<'JSON'
-          {"results": []}
-          JSON
+          printf '%s\n' '{"results": []}' > semgrep-results.json
 
       - name: Perform Semgrep Analysis (full scan on main/master push)
         if: github.event_name == 'push'
@@ -93,9 +91,7 @@ jobs:
         run: |
           set -eu
           if [ ! -s semgrep-results.json ]; then
-            cat > semgrep-results.json <<'JSON'
-            {"results": []}
-            JSON
+            printf '%s\n' '{"results": []}' > semgrep-results.json
           fi
 
       - name: Post Semgrep Results as PR Comment
