@@ -37,19 +37,27 @@ jobs:
       - name: Build PR file scope
         if: github.event_name == 'pull_request'
         id: pr_scope
-        env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -eu
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const issueNumber = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
 
-          git diff --name-only --diff-filter=AM "$PR_BASE_SHA" "$PR_HEAD_SHA" > semgrep-targets.txt
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: issueNumber,
+              per_page: 100
+            });
 
-          if [ -s semgrep-targets.txt ]; then
-            echo "has_targets=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_targets=false" >> "$GITHUB_OUTPUT"
-          fi
+            const targets = files
+              .filter((f) => f.status === 'added' || f.status === 'modified')
+              .map((f) => f.filename);
+
+            fs.writeFileSync('semgrep-targets.txt', `${targets.join('\n')}\n`, 'utf8');
+            core.setOutput('has_targets', targets.length > 0 ? 'true' : 'false');
 
       - name: Perform Semgrep Analysis (PR scoped)
         if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets == 'true'
@@ -58,7 +66,13 @@ jobs:
         continue-on-error: true
         run: |
           set -eu
-          semgrep scan -q --json --config auto $(cat semgrep-targets.txt) > semgrep-results.json
+          set --
+          while IFS= read -r filePath; do
+            [ -n "$filePath" ] || continue
+            set -- "$@" "$filePath"
+          done < semgrep-targets.txt
+
+          semgrep scan -q --json --config auto "$@" > semgrep-results.json
 
       - name: Write empty Semgrep results for PR with no changed files
         if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets != 'true'
@@ -73,6 +87,16 @@ jobs:
         continue-on-error: true
         # Full repository scan for merge/push events on protected branches.
         run: semgrep scan -q --json --config auto . > semgrep-results.json
+
+      - name: Ensure Semgrep results file exists
+        if: always()
+        run: |
+          set -eu
+          if [ ! -s semgrep-results.json ]; then
+            cat > semgrep-results.json <<'JSON'
+            {"results": []}
+            JSON
+          fi
 
       - name: Post Semgrep Results as PR Comment
         if: github.event_name == 'pull_request' && always()
