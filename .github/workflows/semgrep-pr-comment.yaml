@@ -137,7 +137,7 @@ jobs:
             body += '\n';
 
             if (findings.length === 0) {
-              body += 'No findings were detected by Semgrep.\n';
+              body += 'No findings were detected by Semgrep in the changed/new files.\n';
             } else {
               body += '| Severity | Rule | File | Line | Message |\n';
               body += '|---|---|---|---:|---|\n';
@@ -268,7 +268,7 @@ jobs:
             body += `- Findings: **${findings.length}**\n\n`;
 
             if (findings.length === 0) {
-              body += 'No findings were detected by Semgrep.\n';
+              body += 'No findings were detected by Semgrep in main/master branch.\n';
             } else {
               body += '| Severity | Rule | File | Line | Message |\n';
               body += '|---|---|---|---:|---|\n';
