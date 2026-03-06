@@ -1,112 +1,306 @@
 # Name of this GitHub Actions workflow.
-name: Semgrep PR Comment
+name: Semgrep-workaround
 
 on:
-    # Scan changed files in PRs (diff-aware scanning):
-    pull_request: {}
-    # Scan on-demand through GitHub Actions interface:
-    workflow_dispatch: {}
-    # Scan mainline branches:
-    push:
-        branches: ["master", "main"]
+  # Scan changed files in PRs (diff-aware scanning):
+  pull_request: {}
+  # Scan on-demand through GitHub Actions interface:
+  workflow_dispatch: {}
+  # Scan on every push to main branches
+  push:
+    branches: ["master", "main"]
 
 jobs:
-    semgrep_scan:
-        # User definable name of this GitHub Actions job.
-        name: semgrep/pr-comment
-        # If you are self-hosting, change the following `runs-on` value:
-        runs-on: ubuntu-latest
-        container:
-            # A Docker image with Semgrep installed. Do not change this.
-            image: returntocorp/semgrep
-        # Skip any PR created by dependabot to avoid permission issues:
-        if: (github.actor != 'dependabot[bot]')
-        permissions:
-            contents: read
-            pull-requests: write
+  semgrep_scan:
+    # User definable name of this GitHub Actions job.
+    name: semgrep/ci
+    # If you are self-hosting, change the following `runs-on` value:
+    runs-on: ubuntu-latest
+    container:
+      # A Docker image with Semgrep installed. Do not change this.
+      image: returntocorp/semgrep
+    # Skip any PR created by dependabot to avoid permission issues:
+    if: (github.actor != 'dependabot[bot]')
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
 
-        steps:
-            # Fetch project source with GitHub Actions Checkout.
-            - name: Checkout repository
-              uses: actions/checkout@v4
+    steps:
+      # Fetch project source with GitHub Actions Checkout.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Needed for diff-aware PR scanning and merge metadata parsing.
+          fetch-depth: 0
 
-            - name: Perform Semgrep Analysis (JSON)
-              # Export JSON so we can render findings in a pull request comment.
-              continue-on-error: true
-              run: semgrep scan -q --json --config auto . > semgrep-results.json
+      - name: Build PR file scope
+        if: github.event_name == 'pull_request'
+        id: pr_scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
 
-            - name: Post Semgrep Results as PR Comment
-              if: github.event_name == 'pull_request' && always()
-              uses: actions/github-script@v7
-              env:
-                  SEMGREP_RESULTS_PATH: semgrep-results.json
-              with:
-                  github-token: ${{ secrets.GITHUB_TOKEN }}
-                  script: |
-                      const fs = require('fs');
-                      const marker = '<!-- semgrep-pr-comment -->';
-                      const resultsPath = process.env.SEMGREP_RESULTS_PATH;
+          git diff --name-only --diff-filter=AM "$PR_BASE_SHA" "$PR_HEAD_SHA" > semgrep-targets.txt
 
-                      if (!fs.existsSync(resultsPath)) {
-                        core.setFailed(`Semgrep results file not found: ${resultsPath}`);
-                        return;
-                      }
+          if [ -s semgrep-targets.txt ]; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          fi
 
-                      const raw = fs.readFileSync(resultsPath, 'utf8');
-                      const parsed = JSON.parse(raw);
-                      const findings = parsed.results || [];
-                      const errorCount = (parsed.errors || []).length;
+      - name: Perform Semgrep Analysis (PR scoped)
+        if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets == 'true'
+        # Export JSON so we can render findings in a pull request comment.
+        # We don't want to fail the entire workflow if Semgrep finds issues, so we use `continue-on-error: true`.
+        continue-on-error: true
+        run: |
+          set -eu
+          semgrep scan -q --json --config auto $(cat semgrep-targets.txt) > semgrep-results.json
 
-                      let body = `${marker}\n## Semgrep Scan Results\n\n`;
-                      body += `- Findings: **${findings.length}**\n`;
-                      body += `- Errors: **${errorCount}**\n\n`;
+      - name: Write empty Semgrep results for PR with no changed files
+        if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets != 'true'
+        run: |
+          set -eu
+          cat > semgrep-results.json <<'JSON'
+          {"results": []}
+          JSON
 
-                      if (findings.length === 0) {
-                        body += 'No findings were detected by Semgrep.\n';
-                      } else {
-                        body += '| Severity | Rule | File | Line | Message |\n';
-                        body += '|---|---|---|---:|---|\n';
+      - name: Perform Semgrep Analysis (full scan on main/master push)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        # Full repository scan for merge/push events on protected branches.
+        run: semgrep scan -q --json --config auto . > semgrep-results.json
 
-                        for (const finding of findings) {
-                          const severity = finding.extra?.severity || 'UNKNOWN';
-                          const ruleId = finding.check_id || 'n/a';
-                          const file = finding.path || 'n/a';
-                          const line = finding.start?.line || 0;
-                          const message = (finding.extra?.message || '')
-                            .replace(/\|/g, '\\|')
-                            .replace(/\n/g, ' ')
-                            .trim();
+      - name: Post Semgrep Results as PR Comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        env:
+          SEMGREP_RESULTS_PATH: semgrep-results.json
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Summary of script functionality:
+          # 1. Read Semgrep results from JSON file.
+          # 2. Format findings into a Markdown table.
+          # 3. Post as a comment on the pull request, or update existing comment if already posted.
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- semgrep-pr-comment -->';
+            const resultsPath = process.env.SEMGREP_RESULTS_PATH;
 
-                          body += `| ${severity} | ${ruleId} | ${file} | ${line} | ${message} |\n`;
-                        }
-                      }
+            const toGithubDevLink = (relativeFilePath, lineNumber) => {
+              if (!relativeFilePath || !Number.isInteger(lineNumber) || lineNumber <= 0) {
+                return null;
+              }
 
-                      const { owner, repo } = context.repo;
-                      const issue_number = context.payload.pull_request.number;
+              const normalizedFile = String(relativeFilePath).replace(/\\/g, '/').replace(/^\//, '');
+              const { owner, repo } = context.repo;
+              const prRef = context.payload.pull_request?.head?.ref || context.ref.replace('refs/heads/', '');
 
-                      const existingComments = await github.paginate(github.rest.issues.listComments, {
-                        owner,
-                        repo,
-                        issue_number,
-                        per_page: 100
-                      });
+              // Link to github.dev on the PR head branch for easy browser-based code navigation.
+              return `https://github.dev/${owner}/${repo}/blob/${encodeURIComponent(prRef)}/${encodeURI(normalizedFile)}#L${lineNumber}`;
+            };
 
-                      const existing = existingComments.find((c) =>
-                        c.user?.type === 'Bot' && c.body?.includes(marker)
-                      );
+            if (!fs.existsSync(resultsPath)) {
+              core.setFailed(`Semgrep results file not found: ${resultsPath}`);
+              return;
+            }
 
-                      if (existing) {
-                        await github.rest.issues.updateComment({
-                          owner,
-                          repo,
-                          comment_id: existing.id,
-                          body
-                        });
-                      } else {
-                        await github.rest.issues.createComment({
-                          owner,
-                          repo,
-                          issue_number,
-                          body
-                        });
-                      }
+            const raw = fs.readFileSync(resultsPath, 'utf8');
+            const parsed = JSON.parse(raw);
+            const findings = parsed.results || [];
+
+            let body = `${marker}\n## Semgrep Scan Results\n\n`;
+            body += `- Findings: **${findings.length}**\n`;
+            body += '\n';
+
+            if (findings.length === 0) {
+              body += 'No findings were detected by Semgrep.\n';
+            } else {
+              body += '| Severity | Rule | File | Line | Message |\n';
+              body += '|---|---|---|---:|---|\n';
+
+              for (const finding of findings) {
+                const severity = finding.extra?.severity || 'UNKNOWN';
+                const ruleId = finding.check_id || 'n/a';
+                const file = finding.path || 'n/a';
+                const line = finding.start?.line || 0;
+                const githubDevLink = toGithubDevLink(file, line);
+                const fileCell = githubDevLink ? `[${file}](${githubDevLink})` : file;
+                const lineCell = githubDevLink ? `[${line}](${githubDevLink})` : `${line}`;
+                const message = (finding.extra?.message || '')
+                  .replace(/\|/g, '\\|')
+                  .replace(/\n/g, ' ')
+                  .trim();
+
+                body += `| ${severity} | ${ruleId} | ${fileCell} | ${lineCell} | ${message} |\n`;
+              }
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const existingComments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = existingComments.find((c) =>
+              c.user?.type === 'Bot' && c.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Create Semgrep Issue for main/master push
+        if: github.event_name == 'push' && always()
+        uses: actions/github-script@v7
+        env:
+          SEMGREP_RESULTS_PATH: semgrep-results.json
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Summary of script functionality:
+          # 1. Read Semgrep results from JSON file.
+          # 2. Format findings into a Markdown table.
+          # 3. Create a new github_issue with the findings.
+          script: |
+            const fs = require('fs');
+
+            const resultsPath = process.env.SEMGREP_RESULTS_PATH;
+            if (!fs.existsSync(resultsPath)) {
+              core.setFailed(`Semgrep results file not found: ${resultsPath}`);
+              return;
+            }
+
+            const parseMergeSourceBranch = (message) => {
+              if (!message) {
+                return 'direct-push';
+              }
+
+              const mergePrMatch = message.match(/Merge pull request #\d+ from [^/]+\/([^\s]+)/i);
+              if (mergePrMatch?.[1]) {
+                return mergePrMatch[1];
+              }
+
+              const mergeBranchMatch = message.match(/Merge branch '([^']+)'/i);
+              if (mergeBranchMatch?.[1]) {
+                return mergeBranchMatch[1];
+              }
+
+              return 'direct-push';
+            };
+
+            const sanitizeLabelValue = (value) => {
+              const safe = String(value || 'unknown')
+                .toLowerCase()
+                .replace(/[^a-z0-9-_/.]/g, '-')
+                .replace(/[/.]/g, '-')
+                .replace(/-+/g, '-')
+                .replace(/^-|-$/g, '');
+
+              const truncated = safe.slice(0, 40);
+              return truncated || 'unknown';
+            };
+
+            const toCodeLink = (relativeFilePath, lineNumber) => {
+              if (!relativeFilePath || !Number.isInteger(lineNumber) || lineNumber <= 0) {
+                return null;
+              }
+
+              const normalizedFile = String(relativeFilePath).replace(/\\/g, '/').replace(/^\//, '');
+              const { owner, repo } = context.repo;
+              return `https://github.com/${owner}/${repo}/blob/${context.sha}/${encodeURI(normalizedFile)}#L${lineNumber}`;
+            };
+
+            const raw = fs.readFileSync(resultsPath, 'utf8');
+            const parsed = JSON.parse(raw);
+            const findings = parsed.results || [];
+
+            const targetBranch = context.ref.replace('refs/heads/', '');
+            const headMessage = context.payload.head_commit?.message || '';
+            const sourceBranch = parseMergeSourceBranch(headMessage);
+            const sourceBranchLabel = `merged-from:${sanitizeLabelValue(sourceBranch)}`;
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+            const title = `[Semgrep][${targetBranch}] ${timestamp} (${sourceBranch})`;
+
+            let body = '## Semgrep Full Scan Results\n\n';
+            body += `- Target branch: \`${targetBranch}\`\n`;
+            body += `- Source branch: \`${sourceBranch}\`\n`;
+            body += `- Commit: \`${context.sha}\`\n`;
+            body += `- Findings: **${findings.length}**\n\n`;
+
+            if (findings.length === 0) {
+              body += 'No findings were detected by Semgrep.\n';
+            } else {
+              body += '| Severity | Rule | File | Line | Message |\n';
+              body += '|---|---|---|---:|---|\n';
+
+              for (const finding of findings) {
+                const severity = finding.extra?.severity || 'UNKNOWN';
+                const ruleId = finding.check_id || 'n/a';
+                const file = finding.path || 'n/a';
+                const line = finding.start?.line || 0;
+                const codeLink = toCodeLink(file, line);
+                const fileCell = codeLink ? `[${file}](${codeLink})` : file;
+                const lineCell = codeLink ? `[${line}](${codeLink})` : `${line}`;
+                const message = (finding.extra?.message || '')
+                  .replace(/\|/g, '\\|')
+                  .replace(/\n/g, ' ')
+                  .trim();
+
+                body += `| ${severity} | ${ruleId} | ${fileCell} | ${lineCell} | ${message} |\n`;
+              }
+            }
+
+            const { owner, repo } = context.repo;
+
+            const ensureLabel = async (name, color, description) => {
+              try {
+                await github.rest.issues.getLabel({
+                  owner,
+                  repo,
+                  name
+                });
+              } catch (error) {
+                if (error.status === 404) {
+                  await github.rest.issues.createLabel({
+                    owner,
+                    repo,
+                    name,
+                    color,
+                    description
+                  });
+                } else {
+                  throw error;
+                }
+              }
+            };
+
+            await ensureLabel('semgrep-scan', 'd73a4a', 'Semgrep scan reports');
+            await ensureLabel(sourceBranchLabel, '0366d6', 'Semgrep scan source branch');
+
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+              labels: ['semgrep-scan', sourceBranchLabel]
+            });
