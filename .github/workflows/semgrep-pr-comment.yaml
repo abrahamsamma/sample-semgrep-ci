@@ -139,11 +139,21 @@ jobs:
             if (findings.length === 0) {
               body += 'No findings were detected by Semgrep in this PR\'s changes.\n';
             } else {
-              body += '| Severity | Rule | File | Line | Message |\n';
-              body += '|---|---|---|---:|---|\n';
+              body += '| Severity | Confidence | Category | Rule | File | Line | Message |\n';
+              body += '|---|---|---|---|---|---:|---|\n';
 
               for (const finding of findings) {
                 const severity = finding.extra?.severity || 'UNKNOWN';
+                const confidence =
+                  finding.extra?.metadata?.confidence ||
+                  finding.extra?.metadata?.likelihood ||
+                  finding.extra?.metadata?.impact ||
+                  'UNKNOWN';
+                const category =
+                  finding.extra?.metadata?.category ||
+                  finding.extra?.metadata?.cwe ||
+                  finding.extra?.metadata?.owasp ||
+                  'UNKNOWN';
                 const ruleId = finding.check_id || 'n/a';
                 const file = finding.path || 'n/a';
                 const line = finding.start?.line || 0;
@@ -155,7 +165,7 @@ jobs:
                   .replace(/\n/g, ' ')
                   .trim();
 
-                body += `| ${severity} | ${ruleId} | ${fileCell} | ${lineCell} | ${message} |\n`;
+                body += `| ${severity} | ${confidence} | ${category} | ${ruleId} | ${fileCell} | ${lineCell} | ${message} |\n`;
               }
             }
 
@@ -227,6 +237,15 @@ jobs:
               return 'direct-push';
             };
 
+            const parseMergePrNumber = (message) => {
+              if (!message) {
+                return null;
+              }
+
+              const mergePrMatch = message.match(/Merge pull request #(\d+)/i);
+              return mergePrMatch?.[1] || null;
+            };
+
             const sanitizeLabelValue = (value) => {
               const safe = String(value || 'unknown')
                 .toLowerCase()
@@ -252,10 +271,15 @@ jobs:
             const raw = fs.readFileSync(resultsPath, 'utf8');
             const parsed = JSON.parse(raw);
             const findings = parsed.results || [];
+            const { owner, repo } = context.repo;
 
             const targetBranch = context.ref.replace('refs/heads/', '');
             const headMessage = context.payload.head_commit?.message || '';
             const sourceBranch = parseMergeSourceBranch(headMessage);
+            const mergedPrNumber = parseMergePrNumber(headMessage);
+            const mergedPrLink = mergedPrNumber
+              ? `https://github.com/${owner}/${repo}/pull/${mergedPrNumber}`
+              : null;
             const sourceBranchLabel = `merged-from:${sanitizeLabelValue(sourceBranch)}`;
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 
@@ -264,17 +288,31 @@ jobs:
             let body = '## Semgrep Full Scan Results\n\n';
             body += `- Target branch: \`${targetBranch}\`\n`;
             body += `- Source branch: \`${sourceBranch}\`\n`;
+            if (mergedPrLink) {
+              body += `- Incoming branch PR: [#${mergedPrNumber}](${mergedPrLink})\n`;
+            }
             body += `- Commit: \`${context.sha}\`\n`;
             body += `- Findings: **${findings.length}**\n\n`;
+            body += '*These findings are for the `main`/`master` branch only. To see findings (if any) from the PR branch, go to the respective PR report.*\n\n';
 
             if (findings.length === 0) {
               body += 'No findings were detected by Semgrep in main/master branch.\n';
             } else {
-              body += '| Severity | Rule | File | Line | Message |\n';
-              body += '|---|---|---|---:|---|\n';
+              body += '| Severity | Confidence | Category | Rule | File | Line | Message |\n';
+              body += '|---|---|---|---|---|---:|---|\n';
 
               for (const finding of findings) {
                 const severity = finding.extra?.severity || 'UNKNOWN';
+                const confidence =
+                  finding.extra?.metadata?.confidence ||
+                  finding.extra?.metadata?.likelihood ||
+                  finding.extra?.metadata?.impact ||
+                  'UNKNOWN';
+                const category =
+                  finding.extra?.metadata?.category ||
+                  finding.extra?.metadata?.cwe ||
+                  finding.extra?.metadata?.owasp ||
+                  'UNKNOWN';
                 const ruleId = finding.check_id || 'n/a';
                 const file = finding.path || 'n/a';
                 const line = finding.start?.line || 0;
@@ -286,11 +324,9 @@ jobs:
                   .replace(/\n/g, ' ')
                   .trim();
 
-                body += `| ${severity} | ${ruleId} | ${fileCell} | ${lineCell} | ${message} |\n`;
+                body += `| ${severity} | ${confidence} | ${category} | ${ruleId} | ${fileCell} | ${lineCell} | ${message} |\n`;
               }
             }
-
-            const { owner, repo } = context.repo;
 
             const ensureLabel = async (name, color, description) => {
               try {
