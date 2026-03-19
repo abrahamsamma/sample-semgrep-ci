@@ -71,7 +71,7 @@ jobs:
                     args="$args $filePath"
                   done < trivy-targets.txt
                   # shellcheck disable=SC2086
-                  trivy fs --exit-code 0 --quiet --format json $args > trivy-results.json
+                  trivy fs --exit-code 0 --quiet --format json --output trivy-results.json $args
 
             - name: Write empty Trivy results for PR with no changed files
               if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets != 'true'
@@ -82,7 +82,7 @@ jobs:
             - name: Run Trivy Scan (full scan on main/master push)
               if: github.event_name == 'push'
               continue-on-error: true
-              run: trivy fs --exit-code 0 --quiet --format json "${TRIVY_SCAN_SCOPE}" > trivy-results.json
+              run: trivy fs --exit-code 0 --quiet --format json --output trivy-results.json "${TRIVY_SCAN_SCOPE}"
 
             - name: Run Trivy Scan (on-demand)
               if: github.event_name == 'workflow_dispatch'
