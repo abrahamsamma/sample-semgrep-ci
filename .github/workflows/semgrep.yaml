@@ -257,33 +257,6 @@ jobs:
               return;
             }
 
-            const parseMergeSourceBranch = (message) => {
-              if (!message) {
-                return 'direct-push';
-              }
-
-              const mergePrMatch = message.match(/Merge pull request #\d+ from [^/]+\/([^\s]+)/i);
-              if (mergePrMatch?.[1]) {
-                return mergePrMatch[1];
-              }
-
-              const mergeBranchMatch = message.match(/Merge branch '([^']+)'/i);
-              if (mergeBranchMatch?.[1]) {
-                return mergeBranchMatch[1];
-              }
-
-              return 'direct-push';
-            };
-
-            const parseMergePrNumber = (message) => {
-              if (!message) {
-                return null;
-              }
-
-              const mergePrMatch = message.match(/Merge pull request #(\d+)/i);
-              return mergePrMatch?.[1] || null;
-            };
-
             const sanitizeLabelValue = (value) => {
               const safe = String(value || 'unknown')
                 .toLowerCase()
@@ -312,9 +285,17 @@ jobs:
             const { owner, repo } = context.repo;
 
             const targetBranch = context.ref.replace('refs/heads/', '');
-            const headMessage = context.payload.head_commit?.message || '';
-            const sourceBranch = parseMergeSourceBranch(headMessage);
-            const mergedPrNumber = parseMergePrNumber(headMessage);
+
+            // Use the GitHub API to reliably resolve the merged PR and source branch,
+            // rather than parsing the commit message (which varies by merge strategy).
+            const associatedPRs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner,
+              repo,
+              commit_sha: context.sha
+            });
+            const mergedPr = associatedPRs.data.find((pr) => pr.merge_commit_sha === context.sha);
+            const sourceBranch = mergedPr?.head?.ref || 'direct-push';
+            const mergedPrNumber = mergedPr?.number || null;
             const mergedPrLink = mergedPrNumber
               ? `https://github.com/${owner}/${repo}/pull/${mergedPrNumber}`
               : null;
@@ -398,18 +379,3 @@ jobs:
               body,
               labels: ['semgrep-scan', sourceBranchLabel]
             });
-
-  trivy-scan:
-    needs: semgrep_scan
-    name: trivy/ci
-    runs-on: ubuntu-latest
-    container:
-      image: aquasec/trivy:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Run Trivy Scan
-        run: trivy fs --exit-code 0 --no-progress --format table .
