@@ -1,0 +1,437 @@
+name: Trivy
+
+on:
+    push:
+        branches: ["master", "main"]
+    # Scan changed files in PRs (diff-aware scanning):
+    pull_request: {}
+    # Scan on-demand through GitHub Actions interface:
+    workflow_dispatch: {}
+    workflow_call:
+        inputs:
+            scan_scope:
+                description: "Path to scan (default: entire repository)"
+                type: string
+                required: false
+                default: "."
+
+jobs:
+    trivy-scan:
+        name: trivy/ci
+        runs-on: ubuntu-latest
+        container:
+            image: aquasec/trivy:latest
+        # Skip any PR created by dependabot to avoid permission issues:
+        if: (github.actor != 'dependabot[bot]')
+        permissions:
+            contents: read
+            pull-requests: write
+            issues: write
+        env:
+            TRIVY_SCAN_SCOPE: ${{ inputs.scan_scope || '.' }}
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Build PR file scope
+              if: github.event_name == 'pull_request'
+              id: pr_scope
+              uses: actions/github-script@v7
+              with:
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  script: |
+                      const fs = require('fs');
+                      const issueNumber = context.payload.pull_request.number;
+                      const { owner, repo } = context.repo;
+
+                      const files = await github.paginate(github.rest.pulls.listFiles, {
+                        owner,
+                        repo,
+                        pull_number: issueNumber,
+                        per_page: 100
+                      });
+
+                      const targets = files
+                        .filter((f) => f.status === 'added' || f.status === 'modified')
+                        .map((f) => f.filename);
+
+                      fs.writeFileSync('trivy-targets.txt', `${targets.join('\n')}\n`, 'utf8');
+                      core.setOutput('has_targets', targets.length > 0 ? 'true' : 'false');
+
+            - name: Run Trivy Scan (PR diff-aware)
+              if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets == 'true'
+              continue-on-error: true
+              run: |
+                  set -eu
+                  args=""
+                  while IFS= read -r filePath; do
+                    [ -n "$filePath" ] || continue
+                    args="$args $filePath"
+                  done < trivy-targets.txt
+                  # shellcheck disable=SC2086
+                  trivy fs --exit-code 0 --quiet --format json --output trivy-results.json $args
+
+            - name: Write empty Trivy results for PR with no changed files
+              if: github.event_name == 'pull_request' && steps.pr_scope.outputs.has_targets != 'true'
+              run: |
+                  set -eu
+                  printf '%s\n' '{"SchemaVersion":2,"Results":[]}' > trivy-results.json
+
+            - name: Run Trivy Scan (full scan on main/master push)
+              if: github.event_name == 'push'
+              continue-on-error: true
+              run: trivy fs --exit-code 0 --quiet --format json --output trivy-results.json "${TRIVY_SCAN_SCOPE}"
+
+            - name: Run Trivy Scan (on-demand)
+              if: github.event_name == 'workflow_dispatch'
+              run: trivy fs --exit-code 0 --format table "${TRIVY_SCAN_SCOPE}"
+
+            - name: Ensure Trivy results file exists
+              if: github.event_name != 'workflow_dispatch' && always()
+              run: |
+                  set -eu
+                  if [ ! -s trivy-results.json ]; then
+                    printf '%s\n' '{"SchemaVersion":2,"Results":[]}' > trivy-results.json
+                  fi
+
+            - name: Post Trivy Results as PR Comment
+              if: github.event_name == 'pull_request' && always()
+              uses: actions/github-script@v7
+              env:
+                  TRIVY_RESULTS_PATH: trivy-results.json
+              with:
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  # Summary of script functionality:
+                  # 1. Read Trivy results from JSON file.
+                  # 2. Build a summary table (counts by severity/category) and a detailed breakdown table.
+                  # 3. Post as a PR comment, updating the existing bot comment on each push (recreating it if deleted).
+                  script: |
+                      const fs = require('fs');
+                      const marker = '<!-- trivy-pr-comment -->';
+                      const resultsPath = process.env.TRIVY_RESULTS_PATH;
+
+                      if (!fs.existsSync(resultsPath)) {
+                        core.setFailed(`Trivy results file not found: ${resultsPath}`);
+                        return;
+                      }
+
+                      const raw = fs.readFileSync(resultsPath, 'utf8');
+                      const parsed = JSON.parse(raw);
+                      const results = parsed.Results || [];
+
+                      const prRef = context.payload.pull_request?.head?.ref || context.ref.replace('refs/heads/', '');
+                      const { owner, repo } = context.repo;
+                      const issue_number = context.payload.pull_request.number;
+
+                      const toGithubDevLink = (relativeFilePath) => {
+                        if (!relativeFilePath) return null;
+                        const normalizedFile = String(relativeFilePath).replace(/\\/g, '/').replace(/^\//, '');
+                        return `https://github.dev/${owner}/${repo}/blob/${encodeURIComponent(prRef)}/${encodeURI(normalizedFile)}`;
+                      };
+
+                      // Aggregate all vulnerabilities and misconfigurations across results
+                      const allVulns = [];
+                      const allMisconfigs = [];
+                      for (const result of results) {
+                        const target = result.Target || 'n/a';
+                        for (const v of (result.Vulnerabilities || [])) {
+                          allVulns.push({ ...v, _target: target });
+                        }
+                        for (const m of (result.Misconfigurations || [])) {
+                          allMisconfigs.push({ ...m, _target: target });
+                        }
+                      }
+
+                      const totalFindings = allVulns.length + allMisconfigs.length;
+                      const SEVERITIES = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'];
+
+                      const countBySeverity = (items) => {
+                        const counts = Object.fromEntries(SEVERITIES.map((s) => [s, 0]));
+                        for (const item of items) {
+                          const sev = (item.Severity || 'UNKNOWN').toUpperCase();
+                          counts[sev] = (counts[sev] || 0) + 1;
+                        }
+                        return counts;
+                      };
+
+                      const vulnCounts = countBySeverity(allVulns);
+                      const misconfigCounts = countBySeverity(allMisconfigs);
+                      const totalCounts = Object.fromEntries(
+                        SEVERITIES.map((s) => [s, (vulnCounts[s] || 0) + (misconfigCounts[s] || 0)])
+                      );
+
+                      let body = `${marker}\n## Trivy Scan Report — \`${prRef}\`\n\n`;
+                      body += `> Diff-aware scan of changed files on branch \`${prRef}\`\n\n`;
+
+                      // Summary table
+                      body += '### Summary\n\n';
+                      if (totalFindings === 0) {
+                        body += 'No findings detected in the changed files.\n\n';
+                      } else {
+                        body += `Total findings: **${totalFindings}**\n\n`;
+                        body += '| Category | CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN | Total |\n';
+                        body += '|---|---:|---:|---:|---:|---:|---:|\n';
+                        body += `| Vulnerabilities | ${vulnCounts.CRITICAL} | ${vulnCounts.HIGH} | ${vulnCounts.MEDIUM} | ${vulnCounts.LOW} | ${vulnCounts.UNKNOWN} | ${allVulns.length} |\n`;
+                        body += `| Misconfigurations | ${misconfigCounts.CRITICAL} | ${misconfigCounts.HIGH} | ${misconfigCounts.MEDIUM} | ${misconfigCounts.LOW} | ${misconfigCounts.UNKNOWN} | ${allMisconfigs.length} |\n`;
+                        body += `| **Total** | **${totalCounts.CRITICAL}** | **${totalCounts.HIGH}** | **${totalCounts.MEDIUM}** | **${totalCounts.LOW}** | **${totalCounts.UNKNOWN}** | **${totalFindings}** |\n`;
+                        body += '\n';
+                      }
+
+                      // Vulnerabilities breakdown
+                      if (allVulns.length > 0) {
+                        body += '### Vulnerabilities\n\n';
+                        body += '| Severity | CVE | Package | Installed | Fixed | File | Title | Recommended Action |\n';
+                        body += '|---|---|---|---|---|---|---|---|\n';
+                        for (const v of allVulns) {
+                          const severity = v.Severity || 'UNKNOWN';
+                          const cveId = v.VulnerabilityID || 'n/a';
+                          const cveCell = v.PrimaryURL ? `[${cveId}](${v.PrimaryURL})` : cveId;
+                          const pkg = v.PkgName || 'n/a';
+                          const installed = v.InstalledVersion || 'n/a';
+                          const fixed = v.FixedVersion || '';
+                          const fileLink = toGithubDevLink(v._target);
+                          const fileCell = fileLink ? `[${v._target}](${fileLink})` : v._target;
+                          const title = (v.Title || '').replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
+                          const action = fixed
+                            ? `Update \`${pkg}\` to \`${fixed}\``
+                            : 'No fix available — monitor for updates';
+                          body += `| ${severity} | ${cveCell} | ${pkg} | ${installed} | ${fixed || '—'} | ${fileCell} | ${title} | ${action} |\n`;
+                        }
+                        body += '\n';
+                      }
+
+                      // Misconfigurations breakdown
+                      if (allMisconfigs.length > 0) {
+                        body += '### Misconfigurations\n\n';
+                        body += '| Severity | ID | Type | File | Title | Recommended Action |\n';
+                        body += '|---|---|---|---|---|---|\n';
+                        for (const m of allMisconfigs) {
+                          const severity = m.Severity || 'UNKNOWN';
+                          const id = m.ID || m.AVDID || 'n/a';
+                          const idCell = m.PrimaryURL ? `[${id}](${m.PrimaryURL})` : id;
+                          const type = (m.Type || 'n/a').replace(/\|/g, '\\|');
+                          const fileLink = toGithubDevLink(m._target);
+                          const fileCell = fileLink ? `[${m._target}](${fileLink})` : m._target;
+                          const title = (m.Title || '').replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
+                          const action = (m.Resolution || 'Review and remediate configuration')
+                            .replace(/\|/g, '\\|')
+                            .replace(/\n/g, ' ')
+                            .trim();
+                          body += `| ${severity} | ${idCell} | ${type} | ${fileCell} | ${title} | ${action} |\n`;
+                        }
+                        body += '\n';
+                      }
+
+                      // Update existing bot comment or create a new one (handles recreate-if-deleted)
+                      const existingComments = await github.paginate(github.rest.issues.listComments, {
+                        owner,
+                        repo,
+                        issue_number,
+                        per_page: 100
+                      });
+
+                      const existing = existingComments.find(
+                        (c) => c.user?.type === 'Bot' && c.body?.includes(marker)
+                      );
+
+                      if (existing) {
+                        await github.rest.issues.updateComment({
+                          owner,
+                          repo,
+                          comment_id: existing.id,
+                          body
+                        });
+                      } else {
+                        await github.rest.issues.createComment({
+                          owner,
+                          repo,
+                          issue_number,
+                          body
+                        });
+                      }
+
+            - name: Create Trivy Issue for main/master push
+              if: github.event_name == 'push' && always()
+              uses: actions/github-script@v7
+              env:
+                  TRIVY_RESULTS_PATH: trivy-results.json
+              with:
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  # Summary of script functionality:
+                  # 1. Read Trivy results from JSON file.
+                  # 2. Build a summary table and detailed breakdown.
+                  # 3. Create a new GitHub issue labelled with the scan metadata.
+                  script: |
+                      const fs = require('fs');
+                      const resultsPath = process.env.TRIVY_RESULTS_PATH;
+
+                      if (!fs.existsSync(resultsPath)) {
+                        core.setFailed(`Trivy results file not found: ${resultsPath}`);
+                        return;
+                      }
+
+                      const sanitizeLabelValue = (value) => {
+                        const safe = String(value || 'unknown')
+                          .toLowerCase()
+                          .replace(/[^a-z0-9-_/.]/g, '-')
+                          .replace(/[/.]/g, '-')
+                          .replace(/-+/g, '-')
+                          .replace(/^-|-$/g, '');
+                        return safe.slice(0, 40) || 'unknown';
+                      };
+
+                      const toCodeLink = (relativeFilePath) => {
+                        if (!relativeFilePath) return null;
+                        const normalizedFile = String(relativeFilePath).replace(/\\/g, '/').replace(/^\//, '');
+                        const { owner, repo } = context.repo;
+                        return `https://github.com/${owner}/${repo}/blob/${context.sha}/${encodeURI(normalizedFile)}`;
+                      };
+
+                      const raw = fs.readFileSync(resultsPath, 'utf8');
+                      const parsed = JSON.parse(raw);
+                      const results = parsed.Results || [];
+                      const { owner, repo } = context.repo;
+
+                      const allVulns = [];
+                      const allMisconfigs = [];
+                      for (const result of results) {
+                        const target = result.Target || 'n/a';
+                        for (const v of (result.Vulnerabilities || [])) {
+                          allVulns.push({ ...v, _target: target });
+                        }
+                        for (const m of (result.Misconfigurations || [])) {
+                          allMisconfigs.push({ ...m, _target: target });
+                        }
+                      }
+
+                      const totalFindings = allVulns.length + allMisconfigs.length;
+                      const SEVERITIES = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'];
+
+                      const countBySeverity = (items) => {
+                        const counts = Object.fromEntries(SEVERITIES.map((s) => [s, 0]));
+                        for (const item of items) {
+                          const sev = (item.Severity || 'UNKNOWN').toUpperCase();
+                          counts[sev] = (counts[sev] || 0) + 1;
+                        }
+                        return counts;
+                      };
+
+                      const vulnCounts = countBySeverity(allVulns);
+                      const misconfigCounts = countBySeverity(allMisconfigs);
+                      const totalCounts = Object.fromEntries(
+                        SEVERITIES.map((s) => [s, (vulnCounts[s] || 0) + (misconfigCounts[s] || 0)])
+                      );
+
+                      const targetBranch = context.ref.replace('refs/heads/', '');
+
+                      // Use the GitHub API to reliably resolve the merged PR and source branch,
+                      // rather than parsing the commit message (which varies by merge strategy).
+                      const associatedPRs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                        owner,
+                        repo,
+                        commit_sha: context.sha
+                      });
+                      const mergedPr = associatedPRs.data.find((pr) => pr.merge_commit_sha === context.sha);
+                      const sourceBranch = mergedPr?.head?.ref || 'direct-push';
+                      const mergedPrNumber = mergedPr?.number || null;
+                      const mergedPrLink = mergedPrNumber
+                        ? `https://github.com/${owner}/${repo}/pull/${mergedPrNumber}`
+                        : null;
+                      const sourceBranchLabel = `merged-from:${sanitizeLabelValue(sourceBranch)}`;
+                      const timestamp = new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' });
+
+                      const issueTitle = `[Trivy][${targetBranch} <- ${sourceBranch}] ${timestamp}`;
+
+                      let body = `## Trivy Scan Report — \`${targetBranch}\`\n\n`;
+                      body += `> Full repository scan after merge to \`${targetBranch}\`\n\n`;
+                      body += `- Target branch: \`${targetBranch}\`\n`;
+                      body += `- Source branch: \`${sourceBranch}\`\n`;
+                      if (mergedPrLink) {
+                        body += `- Source branch PR: [#${mergedPrNumber}](${mergedPrLink})\n`;
+                      }
+                      body += `- Commit: \`${context.sha}\`\n`;
+                      body += `- Total findings: **${totalFindings}**\n\n`;
+                      body += '*This is a full repository scan of `main`/`master` post-merge. For diff-scoped findings from the PR branch, see the PR comment.*\n\n';
+
+                      // Summary table
+                      body += '### Summary\n\n';
+                      if (totalFindings === 0) {
+                        body += 'No findings detected in the repository.\n\n';
+                      } else {
+                        body += '| Category | CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN | Total |\n';
+                        body += '|---|---:|---:|---:|---:|---:|---:|\n';
+                        body += `| Vulnerabilities | ${vulnCounts.CRITICAL} | ${vulnCounts.HIGH} | ${vulnCounts.MEDIUM} | ${vulnCounts.LOW} | ${vulnCounts.UNKNOWN} | ${allVulns.length} |\n`;
+                        body += `| Misconfigurations | ${misconfigCounts.CRITICAL} | ${misconfigCounts.HIGH} | ${misconfigCounts.MEDIUM} | ${misconfigCounts.LOW} | ${misconfigCounts.UNKNOWN} | ${allMisconfigs.length} |\n`;
+                        body += `| **Total** | **${totalCounts.CRITICAL}** | **${totalCounts.HIGH}** | **${totalCounts.MEDIUM}** | **${totalCounts.LOW}** | **${totalCounts.UNKNOWN}** | **${totalFindings}** |\n`;
+                        body += '\n';
+                      }
+
+                      // Vulnerabilities breakdown
+                      if (allVulns.length > 0) {
+                        body += '### Vulnerabilities\n\n';
+                        body += '| Severity | CVE | Package | Installed | Fixed | File | Title | Recommended Action |\n';
+                        body += '|---|---|---|---|---|---|---|---|\n';
+                        for (const v of allVulns) {
+                          const severity = v.Severity || 'UNKNOWN';
+                          const cveId = v.VulnerabilityID || 'n/a';
+                          const cveCell = v.PrimaryURL ? `[${cveId}](${v.PrimaryURL})` : cveId;
+                          const pkg = v.PkgName || 'n/a';
+                          const installed = v.InstalledVersion || 'n/a';
+                          const fixed = v.FixedVersion || '';
+                          const codeLink = toCodeLink(v._target);
+                          const fileCell = codeLink ? `[${v._target}](${codeLink})` : v._target;
+                          const title = (v.Title || '').replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
+                          const action = fixed
+                            ? `Update \`${pkg}\` to \`${fixed}\``
+                            : 'No fix available — monitor for updates';
+                          body += `| ${severity} | ${cveCell} | ${pkg} | ${installed} | ${fixed || '—'} | ${fileCell} | ${title} | ${action} |\n`;
+                        }
+                        body += '\n';
+                      }
+
+                      // Misconfigurations breakdown
+                      if (allMisconfigs.length > 0) {
+                        body += '### Misconfigurations\n\n';
+                        body += '| Severity | ID | Type | File | Title | Recommended Action |\n';
+                        body += '|---|---|---|---|---|---|\n';
+                        for (const m of allMisconfigs) {
+                          const severity = m.Severity || 'UNKNOWN';
+                          const id = m.ID || m.AVDID || 'n/a';
+                          const idCell = m.PrimaryURL ? `[${id}](${m.PrimaryURL})` : id;
+                          const type = (m.Type || 'n/a').replace(/\|/g, '\\|');
+                          const codeLink = toCodeLink(m._target);
+                          const fileCell = codeLink ? `[${m._target}](${codeLink})` : m._target;
+                          const title = (m.Title || '').replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
+                          const action = (m.Resolution || 'Review and remediate configuration')
+                            .replace(/\|/g, '\\|')
+                            .replace(/\n/g, ' ')
+                            .trim();
+                          body += `| ${severity} | ${idCell} | ${type} | ${fileCell} | ${title} | ${action} |\n`;
+                        }
+                        body += '\n';
+                      }
+
+                      const ensureLabel = async (name, color, description) => {
+                        try {
+                          await github.rest.issues.getLabel({ owner, repo, name });
+                        } catch (error) {
+                          if (error.status === 404) {
+                            await github.rest.issues.createLabel({ owner, repo, name, color, description });
+                          } else {
+                            throw error;
+                          }
+                        }
+                      };
+
+                      await ensureLabel('trivy-scan', '0075ca', 'Trivy scan reports');
+                      await ensureLabel(sourceBranchLabel, '0366d6', 'Trivy scan source branch');
+
+                      await github.rest.issues.create({
+                        owner,
+                        repo,
+                        title: issueTitle,
+                        body,
+                        labels: ['trivy-scan', sourceBranchLabel]
+                      });
