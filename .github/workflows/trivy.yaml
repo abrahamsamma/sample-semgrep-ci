@@ -35,6 +35,29 @@ jobs:
               with:
                   fetch-depth: 0
 
+            - name: Get date for cache key
+              id: date
+              run: echo "date=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+            - name: Cache Trivy databases
+              id: trivy-cache
+              uses: actions/cache@v4
+              with:
+                  path: .cache/trivy
+                  key: trivy-db-${{ runner.os }}-${{ steps.date.outputs.date }}
+                  restore-keys: |
+                      trivy-db-${{ runner.os }}-
+
+            - name: Set Trivy cache dir
+              run: echo "TRIVY_CACHE_DIR=$GITHUB_WORKSPACE/.cache/trivy" >> $GITHUB_ENV
+
+            - name: Skip DB updates on cache hit
+              if: steps.trivy-cache.outputs.cache-hit == 'true'
+              run: |
+                  echo "TRIVY_SKIP_DB_UPDATE=true"       >> $GITHUB_ENV
+                  echo "TRIVY_SKIP_JAVA_DB_UPDATE=true"  >> $GITHUB_ENV
+                  echo "TRIVY_SKIP_CHECK_UPDATE=true"    >> $GITHUB_ENV
+
             - name: Build PR file scope
               if: github.event_name == 'pull_request'
               id: pr_scope
