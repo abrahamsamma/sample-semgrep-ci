@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - dev/trivy+image+sbom
+      - main
 
 jobs:
   build:
