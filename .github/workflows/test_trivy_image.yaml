@@ -1,7 +1,7 @@
 name: Test — Build and Push Vulnerable Image
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
     branches:
       - dev/trivy+image+sbom
