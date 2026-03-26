@@ -1,0 +1,339 @@
+name: Build and Push Docker Image
+
+on:
+  workflow_call:
+    inputs:
+      additional_image_tags:
+        description: 'Additional tags as comma-separated list (e.g., "latest,stable")'
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: "Git branch name"
+        required: true
+        type: string
+      build_args:
+        description: 'Build arguments as JSON string (e.g., {"ARG1":"value1","ARG2":"value2"})'
+        required: false
+        type: string
+        default: "{}"
+      build_context:
+        description: "Docker build context path"
+        required: false
+        type: string
+        default: "."
+      build_platforms:
+        description: 'Target platforms for multi-arch builds (e.g., "linux/amd64,linux/arm64")'
+        required: false
+        type: string
+        default: "linux/amd64"
+      cache_enabled:
+        description: "Enable Docker layer caching"
+        required: false
+        type: boolean
+        default: true
+      commit_id:
+        description: "Git commit SHA"
+        required: true
+        type: string
+      dockerfile_path:
+        description: "Path to the Dockerfile"
+        required: false
+        type: string
+        default: "Dockerfile"
+      git_lfs:
+        description: "Whether to fetch Git LFS objects during checkout (for repos with LFS-tracked build assets)"
+        required: false
+        type: boolean
+        default: false
+      registry_name:
+        description: "Docker Hub username (e.g. abesamma)"
+        required: true
+        type: string
+      runs_on:
+        description: "Runner label; omit to use ubuntu-latest (default)"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      service_name:
+        description: "Docker image name"
+        required: true
+        type: string
+
+    secrets:
+      dockerhub_token:
+        description: "Docker Hub access token for authentication"
+        required: true
+      repo_token:
+        description: "GitHub token for cloning private repos during build (e.g. for git+https deps)"
+        required: false
+
+    outputs:
+      image_tag:
+        description: "The primary image tag generated (branch-commit)"
+        value: ${{ jobs.build-and-push.outputs.image_tag }}
+      full_image_path:
+        description: "Full image path with registry and tag"
+        value: ${{ jobs.build-and-push.outputs.full_image_path }}
+      all_tags:
+        description: "All tags applied to the image"
+        value: ${{ jobs.build-and-push.outputs.all_tags }}
+
+jobs:
+  build-and-push:
+    name: Build and Push to Docker Hub
+    runs-on: ${{ inputs.runs_on != '' && inputs.runs_on || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+
+    outputs:
+      image_tag: ${{ steps.generate-tags.outputs.primary_tag }}
+      full_image_path: ${{ steps.generate-tags.outputs.full_image_path }}
+      all_tags: ${{ steps.generate-tags.outputs.all_tags }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: ${{ inputs.git_lfs }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ inputs.registry_name }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Sanitize branch name
+        id: sanitize
+        env:
+          BRANCH: ${{ inputs.branch }}
+          COMMIT_ID: ${{ inputs.commit_id }}
+        run: |
+          # Remove 'refs/heads/' prefix and sanitize branch name for Docker tag compatibility
+          BRANCH_SANITIZED=$(echo "$BRANCH" | sed 's|refs/heads/||' | sed 's|/|-|g' | tr '[:upper:]' '[:lower:]')
+          echo "branch_sanitized=${BRANCH_SANITIZED}" >> $GITHUB_OUTPUT
+
+          # Short commit SHA (first 7 characters)
+          SHORT_SHA=$(echo "$COMMIT_ID" | cut -c1-7)
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Generate image tags
+        id: generate-tags
+        env:
+          BRANCH_SANITIZED: ${{ steps.sanitize.outputs.branch_sanitized }}
+          SHORT_SHA: ${{ steps.sanitize.outputs.short_sha }}
+          REGISTRY_NAME: ${{ inputs.registry_name }}
+          SERVICE_NAME: ${{ inputs.service_name }}
+          ADDITIONAL_IMAGE_TAGS: ${{ inputs.additional_image_tags }}
+        run: |
+          REGISTRY="${REGISTRY_NAME}"
+          IMAGE_NAME="${SERVICE_NAME}"
+
+          # Primary tag: branch-commit (short SHA)
+          PRIMARY_TAG="${BRANCH_SANITIZED}-${SHORT_SHA}"
+          echo "primary_tag=${PRIMARY_TAG}" >> $GITHUB_OUTPUT
+
+          # Full image path
+          FULL_IMAGE_PATH="${REGISTRY}/${IMAGE_NAME}:${PRIMARY_TAG}"
+          echo "full_image_path=${FULL_IMAGE_PATH}" >> $GITHUB_OUTPUT
+
+          # Build all tags list
+          TAGS="${REGISTRY}/${IMAGE_NAME}:${PRIMARY_TAG}"
+
+          # Add additional tags if provided
+          if [ -n "$ADDITIONAL_IMAGE_TAGS" ]; then
+            IFS=',' read -ra EXTRA_TAGS <<< "$ADDITIONAL_IMAGE_TAGS"
+            for tag in "${EXTRA_TAGS[@]}"; do
+              tag=$(echo "$tag" | xargs) # trim whitespace
+              TAGS="${TAGS},${REGISTRY}/${IMAGE_NAME}:${tag}"
+            done
+          fi
+
+          echo "all_tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "tags_list<<EOF" >> $GITHUB_OUTPUT
+          echo "${TAGS}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Parse build arguments
+        id: parse-args
+        env:
+          BUILD_ARGS_JSON: ${{ inputs.build_args }}
+        run: |
+
+          # Convert JSON to Docker build-arg format
+          BUILD_ARGS=""
+          if [ "$BUILD_ARGS_JSON" != "{}" ]; then
+            BUILD_ARGS=$(echo "$BUILD_ARGS_JSON" | jq -r 'to_entries | map("--build-arg \(.key)=\(.value)") | join(" ")')
+          fi
+
+          echo "build_args=${BUILD_ARGS}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: ${{ inputs.build_platforms }}
+          push: true
+          tags: ${{ steps.generate-tags.outputs.tags_list }}
+          build-args: |
+            ${{ steps.parse-args.outputs.build_args }}
+          secrets: |
+            github_token=${{ secrets.repo_token }}
+          cache-from: ${{ inputs.cache_enabled && format('type=registry,ref={0}/{1}:buildcache', inputs.registry_name, inputs.service_name) || '' }}
+          cache-to: ${{ inputs.cache_enabled && format('type=registry,ref={0}/{1}:buildcache,mode=max', inputs.registry_name, inputs.service_name) || '' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.commit_id }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            com.azure.branch=${{ inputs.branch }}
+            com.azure.commit=${{ inputs.commit_id }}
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
+
+      - name: Scan image with Trivy
+        id: trivy-scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 equiv to v0.35.0
+        with:
+          image-ref: ${{ steps.generate-tags.outputs.full_image_path }}
+          format: json
+          output: trivy-results.json
+          exit-code: "0"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+
+      - name: Generate SBOM with Trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 equiv to v0.35.0
+        with:
+          image-ref: ${{ steps.generate-tags.outputs.full_image_path }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          exit-code: "0"
+
+      - name: Attach SBOM to image in ACR
+        continue-on-error: true
+        run: |
+          oras attach \
+            --artifact-type application/vnd.cyclonedx+json \
+            ${{ steps.generate-tags.outputs.full_image_path }} \
+            ./sbom.cdx.json:application/vnd.cyclonedx+json
+
+      - name: Create Trivy Issue
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        continue-on-error: true
+        env:
+          TRIVY_RESULTS_PATH: trivy-results.json
+          SERVICE_NAME: ${{ inputs.service_name }}
+          IMAGE_TAG: ${{ steps.generate-tags.outputs.primary_tag }}
+          FULL_IMAGE_PATH: ${{ steps.generate-tags.outputs.full_image_path }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Summary of script functionality:
+          # 1. Read Trivy results from JSON file.
+          # 2. Flatten vulnerabilities across all scan targets and sort by severity.
+          # 3. Format findings into a Markdown table.
+          # 4. Create a new GitHub issue with the findings and auto-created labels.
+          script: |
+            const fs = require('fs');
+            const resultsPath = process.env.TRIVY_RESULTS_PATH;
+            const serviceName = process.env.SERVICE_NAME;
+            const imageTag = process.env.IMAGE_TAG;
+            const fullImagePath = process.env.FULL_IMAGE_PATH;
+            const { owner, repo } = context.repo;
+
+            const sanitizeLabelValue = (value) => {
+              const safe = String(value || 'unknown')
+                .toLowerCase()
+                .replace(/[^a-z0-9-_/.]/g, '-')
+                .replace(/[/.]/g, '-')
+                .replace(/-+/g, '-')
+                .replace(/^-|-$/g, '');
+              return safe.slice(0, 40) || 'unknown';
+            };
+
+            const ensureLabel = async (name, color, description) => {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (error) {
+                if (error.status === 404) {
+                  await github.rest.issues.createLabel({ owner, repo, name, color, description });
+                } else {
+                  throw error;
+                }
+              }
+            };
+
+            // Flatten vulnerabilities across all scan targets
+            let vulns = [];
+            if (fs.existsSync(resultsPath)) {
+              const raw = fs.readFileSync(resultsPath, 'utf8');
+              const parsed = JSON.parse(raw);
+              vulns = (parsed.Results || []).reduce((acc, result) => {
+                const targetVulns = (result.Vulnerabilities || []).map(v => ({ ...v, target: result.Target }));
+                return acc.concat(targetVulns);
+              }, []);
+            }
+
+            // Sort by severity
+            const severityOrder = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, UNKNOWN: 4 };
+            vulns.sort((a, b) => (severityOrder[a.Severity] ?? 5) - (severityOrder[b.Severity] ?? 5));
+
+            const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+            for (const v of vulns) {
+              if (v.Severity in counts) counts[v.Severity]++;
+            }
+
+            const timestamp = new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' });
+            const serviceLabel = `service:${sanitizeLabelValue(serviceName)}`;
+            const title = `[Trivy][${serviceName}] ${imageTag} — ${timestamp}`;
+
+            let body = '## Trivy Image Scan Results\n\n';
+            body += `- Image: \`${fullImagePath}\`\n`;
+            body += `- Commit: \`${context.sha}\`\n`;
+            body += `- Total findings: **${vulns.length}**`;
+            if (vulns.length > 0) {
+              body += ` (CRITICAL: ${counts.CRITICAL}, HIGH: ${counts.HIGH}, MEDIUM: ${counts.MEDIUM}, LOW: ${counts.LOW})`;
+            }
+            body += '\n\n';
+
+            if (vulns.length === 0) {
+              body += 'No vulnerabilities were detected in this image.\n';
+            } else {
+              body += '| Severity | Package | Installed | Fixed | CVE | Target | Title |\n';
+              body += '|---|---|---|---|---|---|---|\n';
+              for (const v of vulns) {
+                const cveId = v.VulnerabilityID || 'n/a';
+                const cveCell = v.PrimaryURL ? `[${cveId}](${v.PrimaryURL})` : cveId;
+                const fixedVersion = v.FixedVersion || '—';
+                const titleText = (v.Title || '')
+                  .replace(/\|/g, '\\|')
+                  .replace(/\n/g, ' ')
+                  .trim();
+                body += `| ${v.Severity} | ${v.PkgName} | ${v.InstalledVersion} | ${fixedVersion} | ${cveCell} | ${v.target} | ${titleText} |\n`;
+              }
+            }
+
+            await ensureLabel('trivy-scan', 'e4e669', 'Trivy image scan reports');
+            await ensureLabel(serviceLabel, '0075ca', `Trivy scan for service: ${serviceName}`);
+
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+              labels: ['trivy-scan', serviceLabel]
+            });
+
+      - name: Image summary
+        run: |
+          echo "## Docker Image" >> $GITHUB_STEP_SUMMARY
+          echo "*Image URI:** \`${{ steps.generate-tags.outputs.full_image_path }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ steps.generate-tags.outputs.primary_tag }}\`" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,22 @@
+name: Test — Build and Push Vulnerable Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev/trivy+image+sbom
+      - main
+
+jobs:
+  build:
+    uses: ./.github/workflows/trivy_image.yaml
+    with:
+      registry_name: abesamma
+      service_name: trivy-test-app
+      branch: ${{ github.ref_name }}
+      commit_id: ${{ github.sha }}
+      dockerfile_path: Dockerfile.vuln
+      build_context: .
+      cache_enabled: false
+    secrets:
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
