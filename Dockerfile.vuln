@@ -1,0 +1,25 @@
+# Intentionally vulnerable image — for Trivy CI testing only.
+# DO NOT deploy to production.
+
+# Trivy misconfiguration DS013: base image not pinned to a digest
+FROM python:3.9
+
+# Trivy misconfiguration DS005: ADD used instead of COPY
+ADD . /app
+
+WORKDIR /app
+
+# Install packages with known CVEs to generate vulnerability findings:
+#   cryptography 38.0.0 — CVE-2023-23931, CVE-2023-49083
+#   Pillow 9.0.0        — CVE-2023-44271, CVE-2023-50447
+#   requests 2.18.0     — CVE-2023-32681
+RUN pip install --no-cache-dir \
+    cryptography==38.0.0 \
+    Pillow==9.0.0 \
+    requests==2.18.0
+
+# Trivy misconfiguration DS002: no USER instruction — container runs as root
+
+EXPOSE 8080
+
+CMD ["python", "-m", "http.server", "8080"]
