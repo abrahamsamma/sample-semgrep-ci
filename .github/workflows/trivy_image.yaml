@@ -221,9 +221,12 @@ jobs:
       - name: Attach SBOM to image in ACR
         continue-on-error: true
         run: |
+          # ORAS requires a fully-qualified registry host. Docker Hub images use
+          # the short form (user/image:tag) which ORAS cannot resolve as a hostname.
+          # Prepend registry-1.docker.io/ to produce a valid OCI reference.
           oras attach \
             --artifact-type application/vnd.cyclonedx+json \
-            ${{ steps.generate-tags.outputs.full_image_path }} \
+            registry-1.docker.io/${{ steps.generate-tags.outputs.full_image_path }} \
             ./sbom.cdx.json:application/vnd.cyclonedx+json
 
       - name: Create Trivy Issue
