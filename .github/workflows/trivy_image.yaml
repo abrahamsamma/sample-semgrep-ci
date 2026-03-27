@@ -234,20 +234,28 @@ jobs:
           SERVICE_NAME: ${{ inputs.service_name }}
           IMAGE_TAG: ${{ steps.generate-tags.outputs.primary_tag }}
           FULL_IMAGE_PATH: ${{ steps.generate-tags.outputs.full_image_path }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           # Summary of script functionality:
           # 1. Read Trivy results from JSON file.
           # 2. Flatten vulnerabilities across all scan targets and sort by severity.
           # 3. Format findings into a Markdown table.
-          # 4. Create a new GitHub issue with the findings and auto-created labels.
+          # 4. If the issue body would exceed GitHub's 65,536-character limit, write the
+          #    full table to trivy-full-report.md (uploaded as an artifact by the next
+          #    step) and post a shorter issue body that links to the workflow run instead.
+          # 5. Create a new GitHub issue with the findings and auto-created labels.
           script: |
             const fs = require('fs');
             const resultsPath = process.env.TRIVY_RESULTS_PATH;
             const serviceName = process.env.SERVICE_NAME;
             const imageTag = process.env.IMAGE_TAG;
             const fullImagePath = process.env.FULL_IMAGE_PATH;
+            const runUrl = process.env.RUN_URL;
             const { owner, repo } = context.repo;
+
+            // GitHub Issues API rejects bodies longer than this
+            const GITHUB_ISSUE_BODY_LIMIT = 65536;
 
             const sanitizeLabelValue = (value) => {
               const safe = String(value || 'unknown')
@@ -295,20 +303,23 @@ jobs:
             const serviceLabel = `service:${sanitizeLabelValue(serviceName)}`;
             const title = `[Trivy][${serviceName}] ${imageTag} — ${timestamp}`;
 
-            let body = '## Trivy Image Scan Results\n\n';
-            body += `- Image: \`${fullImagePath}\`\n`;
-            body += `- Commit: \`${context.sha}\`\n`;
-            body += `- Total findings: **${vulns.length}**`;
+            // Build the header block (always included)
+            let header = '## Trivy Image Scan Results\n\n';
+            header += `- Image: \`${fullImagePath}\`\n`;
+            header += `- Commit: \`${context.sha}\`\n`;
+            header += `- Total findings: **${vulns.length}**`;
             if (vulns.length > 0) {
-              body += ` (CRITICAL: ${counts.CRITICAL}, HIGH: ${counts.HIGH}, MEDIUM: ${counts.MEDIUM}, LOW: ${counts.LOW})`;
+              header += ` (CRITICAL: ${counts.CRITICAL}, HIGH: ${counts.HIGH}, MEDIUM: ${counts.MEDIUM}, LOW: ${counts.LOW})`;
             }
-            body += '\n\n';
+            header += '\n\n';
 
+            // Build the vulnerability table
+            let table = '';
             if (vulns.length === 0) {
-              body += 'No vulnerabilities were detected in this image.\n';
+              table += 'No vulnerabilities were detected in this image.\n';
             } else {
-              body += '| Severity | Package | Installed | Fixed | CVE | Target | Title |\n';
-              body += '|---|---|---|---|---|---|---|\n';
+              table += '| Severity | Package | Installed | Fixed | CVE | Target | Title |\n';
+              table += '|---|---|---|---|---|---|---|\n';
               for (const v of vulns) {
                 const cveId = v.VulnerabilityID || 'n/a';
                 const cveCell = v.PrimaryURL ? `[${cveId}](${v.PrimaryURL})` : cveId;
@@ -317,8 +328,24 @@ jobs:
                   .replace(/\|/g, '\\|')
                   .replace(/\n/g, ' ')
                   .trim();
-                body += `| ${v.Severity} | ${v.PkgName} | ${v.InstalledVersion} | ${fixedVersion} | ${cveCell} | ${v.target} | ${titleText} |\n`;
+                table += `| ${v.Severity} | ${v.PkgName} | ${v.InstalledVersion} | ${fixedVersion} | ${cveCell} | ${v.target} | ${titleText} |\n`;
               }
+            }
+
+            let body;
+            const fullBody = header + table;
+
+            if (fullBody.length > GITHUB_ISSUE_BODY_LIMIT) {
+              // The full table is too large for a GitHub issue body. Write it to a
+              // markdown file so the next step can upload it as a workflow artifact,
+              // then post a shorter body that links to the workflow run for download.
+              fs.writeFileSync('trivy-full-report.md', fullBody, 'utf8');
+              body = header;
+              body += `> [!WARNING]\n`;
+              body += `> The full vulnerability table (${vulns.length} findings) exceeds GitHub's 65,536-character issue body limit.\n`;
+              body += `> Download **trivy-full-report.md** from the [workflow run artifacts](${runUrl}) for the complete report.\n`;
+            } else {
+              body = fullBody;
             }
 
             await ensureLabel('trivy-scan', 'e4e669', 'Trivy image scan reports');
@@ -331,6 +358,23 @@ jobs:
               body,
               labels: ['trivy-scan', serviceLabel]
             });
+
+      - name: Upload full Trivy report artifact (if issue body was too long)
+        # Uploads trivy-full-report.md only when the issue body exceeded GitHub's
+        # 65,536-character limit and the previous step wrote the file to disk.
+        # The artifact name includes the service name and image tag so each scan
+        # produces a distinct artifact rather than overwriting previous ones.
+        # retention-days is set to 400, the maximum GitHub allows — as close to
+        # indefinite as the platform supports.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: trivy-full-report-${{ inputs.service_name }}-${{ steps.generate-tags.outputs.primary_tag }}
+          path: trivy-full-report.md
+          if-no-files-found: ignore
+          # GitHub's maximum retention period for artifacts is 400 days.
+          retention-days: 400
 
       - name: Image summary
         run: |
